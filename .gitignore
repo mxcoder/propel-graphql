@@ -1,0 +1,6 @@
+/vendor
+/logs
+/tmp/*
+/app.sq3
+/composer.lock
+/config/propel.php.dist
