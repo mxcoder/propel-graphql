@@ -1,5 +1,4 @@
 <?php
-require __DIR__.'/../vendor/autoload.php';
 return [
     'propel' => [
         'paths' => [
@@ -9,6 +8,7 @@ return [
             'phpConfDir' => __DIR__.'/../tmp',
         ],
         'database' => [
+            'className' => '\\Propel\\Runtime\\Connection\\DebugPDO',
             'connections' => [
                 'default' => [
                     'adapter' => 'sqlite',

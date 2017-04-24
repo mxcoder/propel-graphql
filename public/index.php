@@ -2,16 +2,18 @@
 require '../vendor/autoload.php';
 require '../tmp/config.php';
 
+use GraphQL\GraphQL;
+use GraphQL\Schema;
 use GraphQL\Type\Definition\Config;
 use GraphQL\Type\Definition\ObjectType;
 use GraphQL\Type\Definition\ResolveInfo;
 use GraphQL\Type\Definition\Type;
-use GraphQL\Schema;
-use GraphQL\GraphQL;
 use Propel\Generator\Model\PropelTypes;
+use Propel\Runtime\ActiveQuery\PropelQuery;
+use Propel\Runtime\Map\RelationMap;
 
 // Disable default PHP error reporting - we have better one for debug mode (see bellow)
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);
 
 if (!empty($_GET['debug'])) {
     // Enable additional validation of type configs
@@ -26,22 +28,19 @@ if (!empty($_GET['debug'])) {
 }
 
 try {
-    $Pluralizer = new Propel\Common\Pluralizer\StandardEnglishPluralizer();
     $xml = simplexml_load_file(__DIR__ . '/../src/database/schema.xml');
     $tables = $xml->xpath("table");
+    $pluralizer = new Propel\Common\Pluralizer\StandardEnglishPluralizer();
 
-    $objectTypes = [];
     $types = [];
-    $top_fields = [];
-    $fks = [];
+    $relations = [];
+    $topFields = [];
+    $objectTypes = [];
     foreach ($tables as $table) {
         $model = (string)$table['phpName'];
-        $modelClass = "\\App\\Models\\{$model}";
-        $queryClass = "\\App\\Models\\{$model}Query";
-        $tableMapClass = "\\App\\Models\\Map\\{$model}TableMap";
-        $modelFields = [];
+        $baseFields = [];
         /** @var \Propel\Runtime\Map\TableMap $tableMap */
-        $tableMap = call_user_func([$tableMapClass, 'getTableMap']);
+        $tableMap = call_user_func(["\\App\\Models\\Map\\{$model}TableMap", 'getTableMap']);
         foreach ($tableMap->getColumns() as $columnMap) {
             switch ($columnMap->getType()) {
                 case PropelTypes::TINYINT:
@@ -61,15 +60,14 @@ try {
                     $type = Type::string();
                     break;
             }
-            $modelFields[$columnMap->getPhpName()] = [
+            $baseFields[$columnMap->getPhpName()] = [
                 'type' => $type,
                 'description' => "{$model} {$columnMap->getName()}",
             ];
         }
-        $fks[$model] = [];
-        foreach ($tableMap->getForeignKeys() as $foreignKey) {
-            $relation = $foreignKey->getRelation();
-            $fks[$model][] = [
+        $relations[$model] = [];
+        foreach ($tableMap->getRelations() as $relation) {
+            $relations[$model][] = [
                 'name' => $relation->getName(),
                 'type' => $relation->getType(),
             ];
@@ -77,28 +75,26 @@ try {
         $types[$model] = [
             'name' => $model,
             'description' => "Single {$model}",
-            'fields' => $modelFields,
-            'args' => $modelFields,
-            'queryClass' => $queryClass,
+            'fields' => $baseFields,
+            'args' => $baseFields,
         ];
     }
 
     foreach ($types as $model => &$typeConf) {
         $args = $typeConf['args'];
         unset($typeConf['args']);
-        $queryClass = $typeConf['queryClass'];
-        unset($typeConf['queryClass']);
 
         $objectType = null;
-        $typeFields = function () use (&$objectTypes, $typeConf, $fks, $model) {
-            foreach ($fks[$model] as $relatedModel) {
+        $typeFields = function () use (&$objectTypes, $typeConf, $relations, $model, $pluralizer) {
+            foreach ($relations[$model] as $relatedModel) {
+                $relType = $relatedModel['type'];
                 $relName = $relatedModel['name'];
-                $relType = $objectTypes[$relatedModel['name']];
-                $typeConf['fields'][$relName] = [
-                    'type' => $relatedModel['type'] === \Propel\Runtime\Map\RelationMap::ONE_TO_MANY ? Type::listOf($relType) : $relType,
-                    'description' => "{$model} related {$relName}",
+                $relModel = $objectTypes[$relName];
+                $relEffectiveName = $relType === RelationMap::ONE_TO_MANY ?  $pluralizer->getPluralForm($relName) : $relName;
+                $typeConf['fields'][$relEffectiveName] = [
+                    'type' => $relType === RelationMap::ONE_TO_MANY ? Type::listOf($relModel) : $relModel,
+                    'description' => "{$model} related {$relEffectiveName}",
                     'resolve' => function($root, $args, $context, ResolveInfo $info) {
-                        /** @var \App\Models\Book $root */
                         $getter = "get{$info->fieldName}";
                         return $root->$getter();
                     }
@@ -108,24 +104,22 @@ try {
         };
         $typeConf['fields'] = $typeFields;
         $objectType = new ObjectType($typeConf);
-        $top_fields[$model] = [
+        $topFields[$model] = [
             'type' => $objectType,
             'args' => $args,
-            'resolve' => function($root, $args, $context, ResolveInfo $info) use ($queryClass) {
-                /** @var \Propel\Runtime\ActiveQuery\ModelCriteria $root */
-                $root = new $queryClass;
+            'resolve' => function($root, $args, $context, ResolveInfo $info) use ($model) {
+                $root = PropelQuery::from("\\App\\Models\\{$model}");
                 if (!empty($args)) {
                     $root->filterByArray($args);
                 }
                 return $root->findOne();
             }
         ];
-        $top_fields[$Pluralizer->getPluralForm($model)] = [
+        $topFields[$pluralizer->getPluralForm($model)] = [
             'type' => Type::listOf($objectType),
             'args' => $args,
-            'resolve' => function($root, $args, $context, ResolveInfo $info) use ($queryClass) {
-                /** @var \Propel\Runtime\ActiveQuery\ModelCriteria $root */
-                $root = new $queryClass;
+            'resolve' => function($root, $args, $context, ResolveInfo $info) use ($model) {
+                $root = PropelQuery::from("\\App\\Models\\{$model}");
                 if (!empty($args)) {
                     $root->filterByArray($args);
                 }
@@ -136,12 +130,26 @@ try {
     }
 
     GraphQL::setDefaultFieldResolver(function($source, $args, $context, ResolveInfo $info) {
-        return $source->getByName($info->fieldName);
+        $fieldName = $info->fieldName;
+        $property = null;
+
+        if (is_array($source) || $source instanceof \ArrayAccess) {
+            if (isset($source[$fieldName])) {
+                $property = $source[$fieldName];
+            }
+        } else if ($source instanceof \Propel\Runtime\ActiveRecord\ActiveRecordInterface) {
+            $property = $source->getByName($info->fieldName);
+        } else if (is_object($source)) {
+            if (isset($source->{$fieldName})) {
+                $property = $source->{$fieldName};
+            }
+        }
+        return $property instanceof \Closure ? $property($source, $args, $context) : $property;
     });
 
     $queryType = new ObjectType([
         'name' => 'Query',
-        'fields' => $top_fields,
+        'fields' => $topFields,
     ]);
 
     $schema = new Schema([
@@ -157,16 +165,15 @@ try {
     if (null === $query) {
         $query = '
         {
-            Author {
-                FirstName
-                Book {
-                    Title
+            __schema {
+                types {
+                    name
                 }
             }
         }';
     }
 
-    $result = GraphQL::execute($schema, $query, null, null, $variableValues);
+    $result = GraphQL::executeAndReturnResult($schema, $query, null, null, $variableValues);
 } catch (\Exception $e) {
     $result = ['error' => ['message' => $e->getMessage()]];
 }
